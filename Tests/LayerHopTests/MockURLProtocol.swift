@@ -105,9 +105,16 @@ final class MockURLProtocol: URLProtocol {
         }
         let http = HTTPURLResponse(url: request.url!, statusCode: resp.status, httpVersion: "HTTP/1.1", headerFields: resp.headers)!
         client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+        #if canImport(FoundationNetworking)
+        // swift-corelibs-foundation keeps only the last didLoad chunk of a custom URLProtocol, and the
+        // SDK reads whole bodies on Linux anyway, so deliver the body in one piece there. Chunk
+        // boundaries are still covered by testSSEParserChunking.
+        client?.urlProtocol(self, didLoad: resp.chunks.reduce(Data(), +))
+        #else
         for chunk in resp.chunks {
             client?.urlProtocol(self, didLoad: chunk)
         }
+        #endif
         client?.urlProtocolDidFinishLoading(self)
     }
 
