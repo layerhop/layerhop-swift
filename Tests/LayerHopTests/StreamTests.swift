@@ -20,7 +20,7 @@ final class StreamTests: MockTestCase {
         respond { _ in MockResponse(chunks: self.orderChunks, headers: sseHeaders) }
         var got: [Order] = []
         for try await o in client.streamOrder(quoteId: "q/1") { got.append(o) }
-        XCTAssertEqual(got.count, 2)
+        guard got.count == 2 else { return XCTFail("expected 2 orders, got \(got.count)") }
         XCTAssertEqual(got[0].status, "submitted")
         XCTAssertEqual(got[0].provider, "relay")
         XCTAssertEqual(got[1].status, "filled")
