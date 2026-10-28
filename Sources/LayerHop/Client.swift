@@ -97,7 +97,7 @@ public final class LayerHopClient: Sendable {
 
     func makeRequest(
         _ method: String, _ path: String, query: [(String, String)] = [], body: Data? = nil,
-        accept: String = "application/json"
+        accept: String = "application/json", headers: [String: String] = [:]
     ) throws -> URLRequest {
         var s = baseURL + "/v1" + path
         if !query.isEmpty {
@@ -113,6 +113,7 @@ public final class LayerHopClient: Sendable {
         req.setValue(accept, forHTTPHeaderField: "accept")
         req.setValue(options.userAgent, forHTTPHeaderField: "user-agent")
         if let key = options.apiKey { req.setValue(key, forHTTPHeaderField: "x-api-key") }
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
         if let body {
             req.httpBody = body
             req.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -128,7 +129,7 @@ public final class LayerHopClient: Sendable {
 
     func send<In: Encodable, Out: Decodable>(
         _ method: String, _ path: String, query: [(String, String)] = [], body: In,
-        as _: Out.Type = Out.self
+        headers: [String: String] = [:], as _: Out.Type = Out.self
     ) async throws -> Out {
         let data: Data
         do {
@@ -136,13 +137,14 @@ public final class LayerHopClient: Sendable {
         } catch {
             throw LayerHopError.decoding("encode \(method) \(path): \(error)")
         }
-        return try await perform(method, path, query: query, body: data)
+        return try await perform(method, path, query: query, body: data, headers: headers)
     }
 
     private func perform<Out: Decodable>(
-        _ method: String, _ path: String, query: [(String, String)], body: Data?
+        _ method: String, _ path: String, query: [(String, String)], body: Data?,
+        headers: [String: String] = [:]
     ) async throws -> Out {
-        let req = try makeRequest(method, path, query: query, body: body)
+        let req = try makeRequest(method, path, query: query, body: body, headers: headers)
         let (data, res) = try await transport(req)
         guard (200...299).contains(res.statusCode) else {
             throw decodeAPIError(
@@ -250,6 +252,57 @@ extension LayerHopClient {
         return try await send("GET", "/tokens", query: [("chain", chain)], as: R.self).tokens
     }
 
+    /// Searches / lists the tokens of a chain with prices, one page at a time (`GET /v1/tokens`).
+    /// Pass `nextCursor` back as `cursor` for the next page.
+    public func searchTokens(_ p: TokensParams) async throws -> TokensResponse {
+        var q: [(String, String)] = [("chain", p.chain)]
+        q.add("q", p.q)
+        q.add("limit", p.limit)
+        q.add("cursor", p.cursor)
+        return try await send("GET", "/tokens", query: q)
+    }
+
+    /// One token by address / mint (`GET /v1/tokens/lookup`). Without `chain` the API finds it:
+    /// Solana for a mint, else the supported chain with the most liquidity for the address. Tokens on
+    /// no list are read on chain and have `verified` false.
+    public func lookupToken(address: String, chain: String? = nil) async throws -> Token {
+        struct R: Decodable { let token: Token }
+        var q: [(String, String)] = [("address", address)]
+        q.add("chain", chain)
+        return try await send("GET", "/tokens/lookup", query: q, as: R.self).token
+    }
+
+    /// A token's safety report (`GET /v1/tokens/{chain}/{address}/risk`): honeypots, taxes, fake
+    /// symbols and more. `chain` is an id or slug.
+    public func getTokenRisk(chain: String, address: String) async throws -> TokenRisk {
+        struct R: Decodable { let risk: TokenRisk }
+        return try await send(
+            "GET", "/tokens/\(escapeComponent(chain))/\(escapeComponent(address))/risk", as: R.self
+        ).risk
+    }
+
+    /// USD prices for up to 100 tokens (`GET /v1/prices`), keyed by the ids as given
+    /// (`"chainId:address"`). Ids without a price are omitted. An empty list makes no request.
+    public func prices(ids: [String]) async throws -> [String: Double] {
+        if ids.isEmpty { return [:] }
+        struct R: Decodable { let prices: [String: Double] }
+        return try await send("GET", "/prices", query: [("ids", ids.joined(separator: ","))], as: R.self).prices
+    }
+
+    /// The balances of a wallet, highest USD value first (`GET /v1/balances`). Without `chains`:
+    /// popular EVM chains for an EVM address, Solana for a Solana address. `tokens`
+    /// (`"chainId:address"`, at most 20) are always returned, even at zero; `fresh` skips the
+    /// server's 20 s cache. Chains that fail are listed in `errors`.
+    public func balances(
+        address: String, chains: [String]? = nil, tokens: [String]? = nil, fresh: Bool = false
+    ) async throws -> BalancesResponse {
+        var q: [(String, String)] = [("address", address)]
+        if let chains, !chains.isEmpty { q.append(("chains", chains.joined(separator: ","))) }
+        if let tokens, !tokens.isEmpty { q.append(("tokens", tokens.joined(separator: ","))) }
+        if fresh { q.append(("fresh", "1")) }
+        return try await send("GET", "/balances", query: q)
+    }
+
     /// Asks every provider for a price (`GET /v1/quote`). `best` is the highest output for the user.
     public func quote(_ p: QuoteParams) async throws -> QuoteResponse {
         let slip = (p.slippageBps ?? 0) == 0 ? 50 : p.slippageBps!
@@ -265,14 +318,93 @@ extension LayerHopClient {
         } else if p.gasOnArrival {
             q.append(("gasOnArrival", "true"))
         }
+        if p.gasless { q.append(("gasless", "true")) }
+        q.add("referrer", p.referrer)
+        q.add("copyOf", p.copyOf)
+        q.add("purpose", p.purpose?.rawValue)
+        q.add("splitId", p.splitId)
+        if let s = p.splitShare { q.append(("splitShare", String(s))) }
+        q.add("note", p.note)
         return try await send("GET", "/quote", query: q)
     }
 
+    /// Destination calls (`POST /v1/quote`): an exact-output quote whose output (`dstAmount`) is used
+    /// by contract calls on the destination chain, run by the provider's executor (`msg.sender` is the
+    /// executor, not the user). Only providers that run calls answer; each quote reports `srcAmount`
+    /// and the committed `calls`.
+    public func quoteCalls(_ p: CallsQuoteParams) async throws -> QuoteResponse {
+        struct Body: Encodable {
+            let srcChain, srcToken, dstChain, dstToken, dstAmount, sender, recipient: String
+            let slippageBps: Int
+            let channel: String
+            let integrator: String?
+            let integratorFeeBps: Int?
+            let calls: [DestinationCall]?
+            let action: DestinationAction?
+            let referrer: String?
+            let copyOf: String?
+        }
+        let slip = (p.slippageBps ?? 0) == 0 ? 50 : p.slippageBps!
+        let body = Body(
+            srcChain: p.srcChain, srcToken: p.srcToken, dstChain: p.dstChain, dstToken: p.dstToken,
+            dstAmount: p.dstAmount, sender: p.sender, recipient: p.recipient, slippageBps: slip,
+            channel: options.channel, integrator: options.integrator, integratorFeeBps: options.integratorFeeBps,
+            calls: p.calls, action: p.action,
+            referrer: (p.referrer ?? "").isEmpty ? nil : p.referrer,
+            copyOf: (p.copyOf ?? "").isEmpty ? nil : p.copyOf)
+        return try await send("POST", "/quote", body: body)
+    }
+
+    private struct BuildOrderResponse: Decodable {
+        let tx: BuiltTx?
+        let gasless: GaslessSignRequest?
+    }
+
     /// Returns the unsigned transaction to sign for a quote (`POST /v1/orders`). EVM transactions
-    /// may include an `approval` to send first.
+    /// may include an `approval` to send first; Tron transactions (`.tvm`) an approval transaction.
+    /// Gasless quotes have no transaction: use `buildGasless` (this throws `.decoding` for them).
     public func buildTx(quoteId: String) async throws -> BuiltTx {
-        struct R: Decodable { let tx: BuiltTx }
-        return try await send("POST", "/orders", body: ["quoteId": quoteId], as: R.self).tx
+        let r = try await send("POST", "/orders", body: ["quoteId": quoteId], as: BuildOrderResponse.self)
+        guard let tx = r.tx else {
+            throw LayerHopError.decoding(
+                r.gasless != nil
+                    ? "This quote is gasless; use buildGasless"
+                    : "The API returned no transaction for this quote")
+        }
+        return tx
+    }
+
+    /// Gasless quotes: the EIP-712 typed data to sign (an optional `approval`, then `trade`)
+    /// (`POST /v1/orders`). Records the order. Sign each unchanged with the wallet
+    /// (`eth_signTypedData_v4`), then `submitGasless`. Throws `.decoding` for a quote that is not
+    /// gasless. The SDK never signs.
+    public func buildGasless(quoteId: String) async throws -> GaslessSignRequest {
+        let r = try await send("POST", "/orders", body: ["quoteId": quoteId], as: BuildOrderResponse.self)
+        guard let g = r.gasless else { throw LayerHopError.decoding("This quote is not gasless; use buildTx") }
+        return g
+    }
+
+    /// Gasless: sends the wallet's typed-data signatures (65-byte 0x hex); the provider's relayer
+    /// sends the transaction (`POST /v1/orders/gasless`). `approvalSignature` is required exactly when
+    /// the sign request had an `approval`.
+    public func submitGasless(
+        quoteId: String, tradeSignature: String, approvalSignature: String? = nil
+    ) async throws -> GaslessOrderStatus {
+        struct Signatures: Encodable {
+            let trade: String
+            let approval: String?
+        }
+        struct Body: Encodable {
+            let quoteId: String
+            let signatures: Signatures
+        }
+        let body = Body(quoteId: quoteId, signatures: Signatures(trade: tradeSignature, approval: approvalSignature))
+        return try await send("POST", "/orders/gasless", body: body)
+    }
+
+    /// Gasless: the order's state (`GET /v1/orders/gasless/{quoteId}`); poll until it is final.
+    public func gaslessStatus(quoteId: String) async throws -> GaslessOrderStatus {
+        try await send("GET", "/orders/gasless/\(escapeComponent(quoteId))")
     }
 
     /// Sends a wallet-signed Solana transaction (base64) for `submitViaApi` quotes
@@ -632,6 +764,75 @@ extension LayerHopClient {
     /// Test keys only.
     public func simulateLimitOrder(id: String, outcome: LimitOrderSimulation) async throws -> LimitOrder {
         try await send("POST", "/limit-orders/\(escapeComponent(id))/simulate", body: ["outcome": outcome.rawValue])
+    }
+
+    // MARK: Recurring orders
+
+    /// Creates a Solana recurring buy (beta, Jupiter Recurring, no LayerHop fee)
+    /// (`POST /v1/recurring-orders`). Have `wallet` sign the returned `tx` (sign only), then
+    /// `submitRecurringOrder` with its `requestId`. Nothing is stored by LayerHop.
+    public func createRecurringOrder(_ p: CreateRecurringOrderParams) async throws -> RecurringOrderBuild {
+        try await send("POST", "/recurring-orders", body: p)
+    }
+
+    /// Sends the wallet-signed create or cancel transaction (base64) of a recurring order
+    /// (`POST /v1/recurring-orders/submit`).
+    public func submitRecurringOrder(requestId: String, signedTransaction: String) async throws
+        -> SubmitRecurringOrderResponse
+    {
+        try await send(
+            "POST", "/recurring-orders/submit",
+            body: ["requestId": requestId, "signedTransaction": signedTransaction])
+    }
+
+    /// The recurring orders of a wallet (`GET /v1/recurring-orders`), read live from Jupiter.
+    public func listRecurringOrders(_ p: ListRecurringOrdersParams) async throws -> ListRecurringOrdersResponse {
+        var q: [(String, String)] = [("wallet", p.wallet)]
+        q.add("status", p.status)
+        q.add("page", p.page)
+        return try await send("GET", "/recurring-orders", query: q)
+    }
+
+    /// Cancels a recurring order (`POST /v1/recurring-orders/{id}/cancel`): returns the cancel
+    /// transaction for `wallet` to sign and `submitRecurringOrder` with `requestId`.
+    public func cancelRecurringOrder(id: String, wallet: String) async throws -> CancelRecurringOrderResponse {
+        try await send("POST", "/recurring-orders/\(escapeComponent(id))/cancel", body: ["wallet": wallet])
+    }
+
+    // MARK: Splits, tip jars and payouts
+
+    /// Creates a split bill (`POST /v1/splits`). Public. Keep `editToken`: it is shown only once and
+    /// is needed for `updateSplit`.
+    public func createSplit(_ p: CreateSplitParams) async throws -> SplitCreated {
+        try await send("POST", "/splits", body: p)
+    }
+
+    /// A split with its shares (`GET /v1/splits/{id}`). Public.
+    public func getSplit(id: String) async throws -> Split {
+        try await send("GET", "/splits/\(escapeComponent(id))")
+    }
+
+    /// Changes a split's note, labels or status (`PATCH /v1/splits/{id}`), authorized by the
+    /// `editToken` from `createSplit` (sent as the x-edit-token header).
+    public func updateSplit(id: String, editToken: String, _ p: UpdateSplitParams) async throws -> Split {
+        try await send("PATCH", "/splits/\(escapeComponent(id))", body: p, headers: ["x-edit-token": editToken])
+    }
+
+    /// The tip counters and latest messages of an address (`GET /v1/tip-jars/{address}`). Public.
+    public func getTipJar(address: String) async throws -> TipJar {
+        try await send("GET", "/tip-jars/\(escapeComponent(address))")
+    }
+
+    /// Checks payout rows and groups them into transfer batches and routes
+    /// (`POST /v1/payouts/plan`). Nothing is signed.
+    public func planPayouts(_ p: PlanPayoutsParams) async throws -> PayoutPlan {
+        try await send("POST", "/payouts/plan", body: p)
+    }
+
+    /// Builds one unsigned transfer batch for the payer's wallet (`POST /v1/payouts/transfers`): EVM
+    /// calls or a Solana transaction. The SDK never signs.
+    public func buildPayoutTransfers(_ p: BuildPayoutTransfersParams) async throws -> PayoutTransfers {
+        try await send("POST", "/payouts/transfers", body: p)
     }
 
     // MARK: Refunds

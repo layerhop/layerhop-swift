@@ -8,11 +8,13 @@ import Foundation
 /// SDK-wide constants.
 public enum LayerHop {
     /// The SDK version, sent in the User-Agent header.
-    public static let version = "0.6.0"
+    public static let version = "0.7.0"
     /// The hosted API origin.
     public static let defaultBaseURL = "https://api.layerhop.com"
     /// LayerHop's internal chain id for Solana.
     public static let solanaChainID: Int64 = 7_565_164
+    /// The chain id of Tron mainnet (`vm` "tvm").
+    public static let tronChainID: Int64 = 728_126_428
     /// The default User-Agent header value ("layerhop-swift/<version>").
     public static var defaultUserAgent: String { "layerhop-swift/\(version)" }
 }
@@ -165,6 +167,36 @@ public struct RefundDestinationKind: LayerHopStringValue {
     public static let original: RefundDestinationKind = "original"
     /// The settlement token to the payer's address on the settlement chain.
     public static let settlement: RefundDestinationKind = "settlement"
+}
+
+/// What a quoted payment is for (`QuoteParams.purpose`). Recorded on the order; never changes the
+/// fee or the route.
+public struct QuotePurpose: LayerHopStringValue {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    /// A tip (counted by `getTipJar`).
+    public static let tip: QuotePurpose = "tip"
+    /// One share of a split (with `splitId` and `splitShare`).
+    public static let split: QuotePurpose = "split"
+    /// A routed payout row.
+    public static let payout: QuotePurpose = "payout"
+    public static let gather: QuotePurpose = "gather"
+    public static let rebalance: QuotePurpose = "rebalance"
+    public static let fund: QuotePurpose = "fund"
+}
+
+/// A token safety verdict (`TokenRisk.level`). Show danger prominently and ask for an explicit
+/// confirmation before a buy.
+public struct TokenRiskLevel: LayerHopStringValue {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let ok: TokenRiskLevel = "ok"
+    public static let caution: TokenRiskLevel = "caution"
+    public static let danger: TokenRiskLevel = "danger"
+    /// No source answered.
+    public static let unknown: TokenRiskLevel = "unknown"
 }
 
 /// The type of a webhook event. Samples from the dashboard's "Send test" button have type "webhook.test".
