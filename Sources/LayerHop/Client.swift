@@ -311,7 +311,7 @@ extension LayerHopClient {
         return try await send("GET", "/orders", query: q)
     }
 
-    /// Polls `status` until the order is final (filled / refunded / failed), yielding each state
+    /// Polls `status` until the order is final (filled / refunded / failed / dropped), yielding each state
     /// change. Throws `LayerHopError.watchTimeout` when `timeout` passes first; any request error
     /// ends the stream with that error. Stopping iteration (or cancelling the task) stops polling.
     ///

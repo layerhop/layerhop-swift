@@ -50,9 +50,11 @@ public struct OrderState: LayerHopStringValue {
     public static let refunded: OrderState = "refunded"
     public static let failed: OrderState = "failed"
     public static let unknown: OrderState = "unknown"
+    /// The source transaction never reached the network; no funds moved (re-quote).
+    public static let dropped: OrderState = "dropped"
 
-    /// Whether the state will not change any more (filled, refunded or failed).
-    public var isFinal: Bool { self == .filled || self == .refunded || self == .failed }
+    /// Whether the state will not change any more (filled, refunded, failed or dropped).
+    public var isFinal: Bool { self == .filled || self == .refunded || self == .failed || self == .dropped }
 }
 
 /// The status of a checkout session. Paid is final; treat processing as not yet paid.
@@ -174,6 +176,7 @@ public struct WebhookEventType: LayerHopStringValue {
     public static let orderFilled: WebhookEventType = "order.filled"
     public static let orderRefunded: WebhookEventType = "order.refunded"
     public static let orderFailed: WebhookEventType = "order.failed"
+    public static let orderDropped: WebhookEventType = "order.dropped"
     public static let checkoutSessionProcessing: WebhookEventType = "checkout.session.processing"
     public static let checkoutSessionCompleted: WebhookEventType = "checkout.session.completed"
     public static let checkoutSessionPaymentFailed: WebhookEventType = "checkout.session.payment_failed"
