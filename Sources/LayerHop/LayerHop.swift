@@ -8,7 +8,7 @@ import Foundation
 /// SDK-wide constants.
 public enum LayerHop {
     /// The SDK version, sent in the User-Agent header.
-    public static let version = "0.7.0"
+    public static let version = "0.8.0"
     /// The hosted API origin.
     public static let defaultBaseURL = "https://api.layerhop.com"
     /// LayerHop's internal chain id for Solana.

@@ -17,7 +17,7 @@ Xcode: **File → Add Package Dependencies…** and enter `https://github.com/la
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/layerhop/layerhop-swift", from: "0.7.0"),
+    .package(url: "https://github.com/layerhop/layerhop-swift", from: "0.8.0"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "LayerHop", package: "layerhop-swift")]),
@@ -80,7 +80,7 @@ let lh = LayerHopClient(options: .init(
     channel: "api",                      // default
     integrator: "myapp",                 // your partner id, sent on every quote
     integratorFeeBps: 25,                // honored only with a partner key
-    userAgent: "layerhop-swift/0.7.0"    // default
+    userAgent: "layerhop-swift/0.8.0"    // default
 ), session: myURLSession)                // optional custom URLSession
 ```
 

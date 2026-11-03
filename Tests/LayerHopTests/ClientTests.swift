@@ -12,8 +12,8 @@ final class ClientTests: MockTestCase {
         let c = LayerHopClient()
         XCTAssertEqual(c.baseURL, "https://api.layerhop.com")
         XCTAssertEqual(c.options.channel, "api")
-        XCTAssertEqual(c.options.userAgent, "layerhop-swift/0.7.0")
-        XCTAssertEqual(LayerHop.version, "0.7.0")
+        XCTAssertEqual(c.options.userAgent, "layerhop-swift/0.8.0")
+        XCTAssertEqual(LayerHop.version, "0.8.0")
         XCTAssertNil(c.options.apiKey)
 
         let c2 = LayerHopClient(apiKey: "", baseURL: "https://x.test///", channel: "", userAgent: "")
@@ -31,7 +31,7 @@ final class ClientTests: MockTestCase {
         XCTAssertEqual(last.method, "GET")
         XCTAssertEqual(last.url.absoluteString, "https://api.test/v1/health")
         XCTAssertEqual(last.header("x-api-key"), "k1")
-        XCTAssertEqual(last.header("user-agent"), "layerhop-swift/0.7.0")
+        XCTAssertEqual(last.header("user-agent"), "layerhop-swift/0.8.0")
         XCTAssertEqual(last.header("accept"), "application/json")
         XCTAssertNil(last.header("content-type"))
 
