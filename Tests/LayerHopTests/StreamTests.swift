@@ -29,7 +29,7 @@ final class StreamTests: MockTestCase {
         XCTAssertEqual(last.rawPath, "/v1/orders/q%2F1/events")
         XCTAssertEqual(last.header("accept"), "text/event-stream")
         XCTAssertEqual(last.header("x-api-key"), "k1")
-        XCTAssertEqual(last.header("user-agent"), "layerhop-swift/0.6.0")
+        XCTAssertEqual(last.header("user-agent"), "layerhop-swift/0.7.0")
     }
 
     func testStreamCheckoutSession() async throws {

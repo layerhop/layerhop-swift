@@ -8,11 +8,13 @@ import Foundation
 /// SDK-wide constants.
 public enum LayerHop {
     /// The SDK version, sent in the User-Agent header.
-    public static let version = "0.6.0"
+    public static let version = "0.7.0"
     /// The hosted API origin.
     public static let defaultBaseURL = "https://api.layerhop.com"
     /// LayerHop's internal chain id for Solana.
     public static let solanaChainID: Int64 = 7_565_164
+    /// The chain id of Tron mainnet (`vm` "tvm").
+    public static let tronChainID: Int64 = 728_126_428
     /// The default User-Agent header value ("layerhop-swift/<version>").
     public static var defaultUserAgent: String { "layerhop-swift/\(version)" }
 }
@@ -50,9 +52,11 @@ public struct OrderState: LayerHopStringValue {
     public static let refunded: OrderState = "refunded"
     public static let failed: OrderState = "failed"
     public static let unknown: OrderState = "unknown"
+    /// The source transaction never reached the network; no funds moved (re-quote).
+    public static let dropped: OrderState = "dropped"
 
-    /// Whether the state will not change any more (filled, refunded or failed).
-    public var isFinal: Bool { self == .filled || self == .refunded || self == .failed }
+    /// Whether the state will not change any more (filled, refunded, failed or dropped).
+    public var isFinal: Bool { self == .filled || self == .refunded || self == .failed || self == .dropped }
 }
 
 /// The status of a checkout session. Paid is final; treat processing as not yet paid.
@@ -165,6 +169,36 @@ public struct RefundDestinationKind: LayerHopStringValue {
     public static let settlement: RefundDestinationKind = "settlement"
 }
 
+/// What a quoted payment is for (`QuoteParams.purpose`). Recorded on the order; never changes the
+/// fee or the route.
+public struct QuotePurpose: LayerHopStringValue {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    /// A tip (counted by `getTipJar`).
+    public static let tip: QuotePurpose = "tip"
+    /// One share of a split (with `splitId` and `splitShare`).
+    public static let split: QuotePurpose = "split"
+    /// A routed payout row.
+    public static let payout: QuotePurpose = "payout"
+    public static let gather: QuotePurpose = "gather"
+    public static let rebalance: QuotePurpose = "rebalance"
+    public static let fund: QuotePurpose = "fund"
+}
+
+/// A token safety verdict (`TokenRisk.level`). Show danger prominently and ask for an explicit
+/// confirmation before a buy.
+public struct TokenRiskLevel: LayerHopStringValue {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let ok: TokenRiskLevel = "ok"
+    public static let caution: TokenRiskLevel = "caution"
+    public static let danger: TokenRiskLevel = "danger"
+    /// No source answered.
+    public static let unknown: TokenRiskLevel = "unknown"
+}
+
 /// The type of a webhook event. Samples from the dashboard's "Send test" button have type "webhook.test".
 public struct WebhookEventType: LayerHopStringValue {
     public let rawValue: String
@@ -174,6 +208,7 @@ public struct WebhookEventType: LayerHopStringValue {
     public static let orderFilled: WebhookEventType = "order.filled"
     public static let orderRefunded: WebhookEventType = "order.refunded"
     public static let orderFailed: WebhookEventType = "order.failed"
+    public static let orderDropped: WebhookEventType = "order.dropped"
     public static let checkoutSessionProcessing: WebhookEventType = "checkout.session.processing"
     public static let checkoutSessionCompleted: WebhookEventType = "checkout.session.completed"
     public static let checkoutSessionPaymentFailed: WebhookEventType = "checkout.session.payment_failed"

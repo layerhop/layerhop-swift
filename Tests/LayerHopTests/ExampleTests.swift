@@ -31,6 +31,8 @@ final class ExampleTests: MockTestCase {
             txHash = svm.submitViaApi
                 ? try await lh.submit(quoteId: q.best.quoteId, signedTransaction: signed)
                 : "broadcast-by-wallet"
+        case .tvm(let tron):
+            txHash = tron.unsigned?.txID ?? "" // a Tron wallet would sign and broadcast here
         }
         XCTAssertEqual(txHash, "5sig")
         _ = try await lh.reportSubmitted(quoteId: q.best.quoteId, txHash: txHash)

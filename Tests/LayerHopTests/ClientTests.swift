@@ -12,8 +12,8 @@ final class ClientTests: MockTestCase {
         let c = LayerHopClient()
         XCTAssertEqual(c.baseURL, "https://api.layerhop.com")
         XCTAssertEqual(c.options.channel, "api")
-        XCTAssertEqual(c.options.userAgent, "layerhop-swift/0.6.0")
-        XCTAssertEqual(LayerHop.version, "0.6.0")
+        XCTAssertEqual(c.options.userAgent, "layerhop-swift/0.7.0")
+        XCTAssertEqual(LayerHop.version, "0.7.0")
         XCTAssertNil(c.options.apiKey)
 
         let c2 = LayerHopClient(apiKey: "", baseURL: "https://x.test///", channel: "", userAgent: "")
@@ -31,7 +31,7 @@ final class ClientTests: MockTestCase {
         XCTAssertEqual(last.method, "GET")
         XCTAssertEqual(last.url.absoluteString, "https://api.test/v1/health")
         XCTAssertEqual(last.header("x-api-key"), "k1")
-        XCTAssertEqual(last.header("user-agent"), "layerhop-swift/0.6.0")
+        XCTAssertEqual(last.header("user-agent"), "layerhop-swift/0.7.0")
         XCTAssertEqual(last.header("accept"), "application/json")
         XCTAssertNil(last.header("content-type"))
 
@@ -324,6 +324,16 @@ final class ClientTests: MockTestCase {
         XCTAssertEqual(last.rawPath, "/v1/orders/relay/0x1")
     }
 
+    func testWatchEndsOnDropped() async throws {
+        statusSequence(["pending", "dropped", "pending"])
+        var got: [String] = []
+        for try await st in client.watch(provider: "relay", id: "0x1", interval: 0.001) {
+            got.append(st.state.rawValue)
+        }
+        XCTAssertEqual(got, ["pending", "dropped"])
+        XCTAssertEqual(requestCount, 2)
+    }
+
     func testWatchBreakStopsPolling() async throws {
         statusSequence(["pending"])
         for try await _ in client.watch(provider: "relay", id: "0x1", interval: 0.3) { break }
@@ -375,7 +385,7 @@ final class ClientTests: MockTestCase {
     }
 
     func testIsFinal() {
-        let cases: [(OrderState, Bool)] = [("filled", true), ("refunded", true), ("failed", true), ("pending", false), ("unknown", false)]
+        let cases: [(OrderState, Bool)] = [("filled", true), ("refunded", true), ("failed", true), ("dropped", true), ("pending", false), ("unknown", false)]
         for (s, want) in cases { XCTAssertEqual(s.isFinal, want, s.rawValue) }
         XCTAssertTrue(LimitOrderStatus.cancelled.isFinal)
         XCTAssertFalse(LimitOrderStatus.open.isFinal)

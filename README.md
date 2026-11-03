@@ -17,7 +17,7 @@ Xcode: **File → Add Package Dependencies…** and enter `https://github.com/la
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/layerhop/layerhop-swift", from: "0.6.0"),
+    .package(url: "https://github.com/layerhop/layerhop-swift", from: "0.7.0"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "LayerHop", package: "layerhop-swift")]),
@@ -52,6 +52,10 @@ case .svm(let svm):
     txHash = svm.submitViaApi
         ? try await lh.submit(quoteId: q.best.quoteId, signedTransaction: signed) // sign only; LayerHop broadcasts
         : try await wallet.broadcastSolana(signed)
+case .tvm(let tron):
+    // Tron: sign tron.approval?.unsigned (when set) and tron.unsigned unchanged with a Tron wallet,
+    // broadcast before raw_data.expiration, then report the main tx's txID (bare 64-hex)
+    txHash = try await wallet.sendTron(tron)
 }
 
 // 4. Report the broadcast so LayerHop tracks it
@@ -65,6 +69,8 @@ for try await st in lh.watch(provider: q.best.provider, id: txHash) {
 
 Gas on arrival: `QuoteParams(..., gasOnArrival: true)` (sent as `gasOnArrival=true`, about $2 of native gas) or `gasOnArrivalUsd: 5` (sent as `gasOnArrivalUsd=5`). Check `q.best.gasOnArrival`.
 
+`QuoteParams` also takes `gasless`, `referrer`, `copyOf`, `purpose` (`.tip`, `.split`, `.payout`, ...), `splitId`, `splitShare` and `note`.
+
 ## Options
 
 ```swift
@@ -74,7 +80,7 @@ let lh = LayerHopClient(options: .init(
     channel: "api",                      // default
     integrator: "myapp",                 // your partner id, sent on every quote
     integratorFeeBps: 25,                // honored only with a partner key
-    userAgent: "layerhop-swift/0.6.0"    // default
+    userAgent: "layerhop-swift/0.7.0"    // default
 ), session: myURLSession)                // optional custom URLSession
 ```
 
@@ -82,8 +88,9 @@ let lh = LayerHopClient(options: .init(
 
 | Area | Methods |
 |---|---|
-| Registry | `health()`, `chains()`, `tokens(chain:)`, `serviceStatus()` |
-| Swaps | `quote(_:)`, `buildTx(quoteId:)`, `simulate(quoteId:)`, `submit(quoteId:signedTransaction:)`, `reportSubmitted(quoteId:txHash:)` |
+| Registry | `health()`, `chains()`, `tokens(chain:)`, `searchTokens(_:)`, `lookupToken(address:chain:)`, `getTokenRisk(chain:address:)`, `prices(ids:)`, `balances(address:chains:tokens:fresh:)`, `serviceStatus()` |
+| Swaps | `quote(_:)`, `quoteCalls(_:)`, `buildTx(quoteId:)`, `simulate(quoteId:)`, `submit(quoteId:signedTransaction:)`, `reportSubmitted(quoteId:txHash:)` |
+| Gasless | `buildGasless(quoteId:)`, `submitGasless(quoteId:tradeSignature:approvalSignature:)`, `gaslessStatus(quoteId:)` |
 | Orders | `status(provider:id:)`, `watch(provider:id:interval:timeout:)`, `listOrders(_:)`, `streamOrder(quoteId:)` |
 | Checkout | `createCheckoutSession`, `getCheckoutSession(id:)`, `listCheckoutSessions`, `expireCheckoutSession(id:)`, `quoteCheckoutSession(id:_:)`, `streamCheckoutSession(id:)` |
 | Products | `createCheckoutProduct`, `getCheckoutProduct(id:)`, `listCheckoutProducts`, `updateCheckoutProduct(id:_:)`, `startProductCheckout(id:_:)` |
@@ -92,6 +99,8 @@ let lh = LayerHopClient(options: .init(
 | Deposit addresses | `createDepositAddress`, `getDepositAddress(id:)`, `listDepositAddresses`, `refreshDepositAddress(id:)`, `disableDepositAddress(id:)`, `simulateDeposit(id:amount:)` |
 | Subscriptions | `createSubscription`, `getSubscription(id:)`, `listSubscriptions`, `updateSubscription(id:_:)`, `cancelSubscription(id:atPeriodEnd:)`, `pauseSubscription(id:)`, `resumeSubscription(id:)`, `listSubscriptionInvoices(id:)` |
 | Limit orders (Solana) | `createLimitOrder`, `submitLimitOrder(id:signedTransaction:)`, `getLimitOrder(id:)`, `listLimitOrders`, `cancelLimitOrder(id:)`, `simulateLimitOrder(id:outcome:)` |
+| Recurring orders (Solana) | `createRecurringOrder`, `submitRecurringOrder(requestId:signedTransaction:)`, `listRecurringOrders`, `cancelRecurringOrder(id:wallet:)` |
+| Splits, tips, payouts | `createSplit`, `getSplit(id:)`, `updateSplit(id:editToken:_:)`, `getTipJar(address:)`, `planPayouts`, `buildPayoutTransfers` |
 | Webhooks | `streamWebhookEvents()`, `triggerWebhookEvent(type:)`, `Webhook.verifySignature`, `Webhook.constructEvent`, `Webhook.sign` |
 
 ### Checkout
@@ -138,7 +147,69 @@ let lo = try await lh.createLimitOrder(CreateLimitOrderParams(
 _ = try await lh.submitLimitOrder(id: lo.id, signedTransaction: signedBase64)
 ```
 
-Update params (`UpdateCheckoutProductParams`, `UpdateInvoiceParams`, `UpdateSubscriptionParams`) send only non-nil fields; an empty string clears a nullable field (sent as `null`).
+### Tron
+
+`buildTx` returns `.tvm(TronTx)` for Tron routes. The SDK never signs: send `approval` first when set, then the main transaction; sign each `unsigned` unchanged with a Tron wallet (TronWeb / TronLink; `unsigned.jsonString()` gives the node's JSON) and broadcast before `raw_data.expiration`. Report the main `txID` (bare 64-hex). `simulate` reports `energyUsed`.
+
+### Gasless swaps
+
+```swift
+let q = try await lh.quote(QuoteParams(
+    srcChain: "base", srcToken: "USDC", amount: "100000000", dstChain: "base", dstToken: "WETH",
+    sender: "0xYou", recipient: "0xYou", gasless: true))
+let req = try await lh.buildGasless(quoteId: q.best.quoteId)
+// sign req.approval?.eip712 (when set) and req.trade.eip712 unchanged (eth_signTypedData_v4; .jsonString())
+let st = try await lh.submitGasless(quoteId: q.best.quoteId, tradeSignature: tradeSig, approvalSignature: approvalSig)
+// poll gaslessStatus(quoteId:) until st.state.isFinal
+```
+
+`buildTx` on a gasless quote throws `.decoding("This quote is gasless; use buildGasless")`.
+
+### Destination calls
+
+```swift
+let r = try await lh.quoteCalls(CallsQuoteParams(
+    srcChain: "base", srcToken: "USDC", dstChain: "arbitrum", dstToken: "USDC", dstAmount: "100000000",
+    sender: "0xYou", recipient: "0xYou", action: .aaveV3Supply)) // or calls: [DestinationCall(to:data:)]
+print(r.best.srcAmount ?? "", r.best.calls?.simulation?.ok ?? false)
+```
+
+### Tokens and risk
+
+```swift
+let page = try await lh.searchTokens(TokensParams(chain: "base", q: "usd"))   // page.nextCursor
+let token = try await lh.lookupToken(address: "0x...")                       // chain optional
+let risk = try await lh.getTokenRisk(chain: "base", address: token.address)  // .ok / .caution / .danger / .unknown
+let prices = try await lh.prices(ids: ["8453:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"])
+let bal = try await lh.balances(address: "0xYou", chains: ["base"], fresh: true)
+```
+
+`Chain` carries `destinationOnly`, `onlyRoute` and `routeHealth`.
+
+### Splits, tip jars and payouts
+
+```swift
+let split = try await lh.createSplit(CreateSplitParams(
+    recipient: "ada.eth", chain: "base", token: "USDC", total: "90000000", participants: 3))
+// keep split.editToken (shown once); each person pays with quote(... purpose: .split, splitId:, splitShare:)
+_ = try await lh.updateSplit(id: split.id, editToken: split.editToken, UpdateSplitParams(status: "closed"))
+let jar = try await lh.getTipJar(address: "0xYou")
+let plan = try await lh.planPayouts(PlanPayoutsParams(srcChain: "base", srcToken: "USDC", sender: "0xYou", csv: csvText))
+let batch = try await lh.buildPayoutTransfers(BuildPayoutTransfersParams(
+    chain: "base", token: "USDC", sender: "0xYou", transfers: [PayoutTransfer(recipient: "0xA", amount: "25000000")]))
+// sign batch.calls (EVM) or batch.serializedTx (Solana) with your wallet
+```
+
+### Recurring orders
+
+```swift
+let b = try await lh.createRecurringOrder(CreateRecurringOrderParams(
+    wallet: "YourSolanaAddress", dstToken: "SOL", amount: "300000000", orders: 3, intervalSeconds: 86400))
+// sign b.tx (sign only), then:
+_ = try await lh.submitRecurringOrder(requestId: b.requestId, signedTransaction: signedBase64)
+```
+
+Update params (`UpdateCheckoutProductParams`, `UpdateInvoiceParams`, `UpdateSubscriptionParams`, `UpdateSplitParams`) send only non-nil fields; an empty string clears a nullable field (sent as `null`).
 
 ## Errors
 
@@ -149,7 +220,7 @@ do {
     _ = try await lh.buildTx(quoteId: quoteId)
 } catch let e as LayerHopError {
     switch e {
-    case .api(let code, let message, let status, let requestId):
+    case .api(let code, let message, let status, let requestId, _):
         print(code, message, status, requestId ?? "", e.docsURL!) // e.g. QUOTE_EXPIRED: re-quote
     case .network(let urlError): print(urlError)
     case .decoding(let detail): print(detail)
@@ -158,7 +229,15 @@ do {
 }
 ```
 
-`e.code`, `e.message`, `e.status` and `e.requestId` are also available as properties. Codes are listed at https://docs.layerhop.com/errors.
+`e.code`, `e.message`, `e.status`, `e.requestId` and `e.details` (the raw `error.details` as a `JSONValue`) are also available as properties. Codes are listed at https://docs.layerhop.com/errors.
+
+Typed helpers read `details`:
+
+- `e.suggestions`: on `NO_ROUTE`, alternatives that did quote (`kind` `dst_token`, `src_token` or `via_hub` with `hub` and two `steps`); at most 4, malformed entries dropped. Quote again before signing.
+- `e.minAmount`, `e.minAmountUsd`, `e.minAmountApprox`: the route minimum on `AMOUNT_TOO_SMALL`.
+- `e.providerErrors`: per-provider failures.
+
+0.7.0 added the `details` value to `.api` and the `.tvm` case to `BuiltTx`: exhaustive `switch` statements need `, _` / the new case.
 
 ## Verify webhooks
 
