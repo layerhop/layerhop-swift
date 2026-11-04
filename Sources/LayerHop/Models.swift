@@ -366,8 +366,12 @@ public struct Quote: Codable, Sendable, Equatable {
     public let expiresAt: Int64
     /// Set when gas on arrival was requested and this route includes it.
     public let gasOnArrival: GasOnArrival?
-    /// What the sender pays (base units of the source token), on destination-call quotes.
+    /// What the sender pays (base units of the source token), on exact-output quotes
+    /// (`quoteExactOutput`, `quoteCalls`).
     public let srcAmount: String?
+    /// Exact-output quotes: the most the transaction can take from the sender, slippage included
+    /// (>= `srcAmount`). Use it for balance checks.
+    public let srcAmountMax: String?
     /// The destination calls the provider will run (`quoteCalls` only).
     public let calls: DestinationCallsPlan?
     /// Set on gasless quotes: build them with `buildGasless`, not `buildTx`.
@@ -390,6 +394,132 @@ public struct QuoteResponse: Codable, Sendable, Equatable {
     public let warnings: [QuoteWarning]?
     /// False when the request used an lh_test_ key (sandbox quotes). Nil means live.
     public let livemode: Bool?
+    /// Address screening (D-069): which addresses of this request are on the OFAC SDN list. Nil until
+    /// the API has a list loaded.
+    public let screening: ScreeningAnnotation?
+}
+
+/// The inputs of an exact-output `GET /v1/quote`: the recipient gets exactly `dstAmount`; each
+/// quote reports `srcAmount` (what the sender pays) and `srcAmountMax` (the most the transaction can
+/// take). Only providers that quote a fixed output answer. Not with gas on arrival or gasless.
+public struct ExactOutputQuoteParams: Sendable, Equatable {
+    public var srcChain: String
+    public var srcToken: String
+    /// The exact amount of `dstToken` the recipient receives (base units).
+    public var dstAmount: String
+    public var dstChain: String
+    public var dstToken: String
+    public var sender: String
+    public var recipient: String
+    /// Defaults to 50 when nil or 0.
+    public var slippageBps: Int?
+    public var referrer: String?
+    public var copyOf: String?
+    public var purpose: QuotePurpose?
+    public var splitId: String?
+    public var splitShare: Int?
+    public var note: String?
+
+    public init(
+        srcChain: String, srcToken: String, dstAmount: String,
+        dstChain: String, dstToken: String,
+        sender: String, recipient: String,
+        slippageBps: Int? = nil, referrer: String? = nil, copyOf: String? = nil,
+        purpose: QuotePurpose? = nil, splitId: String? = nil, splitShare: Int? = nil, note: String? = nil
+    ) {
+        self.srcChain = srcChain
+        self.srcToken = srcToken
+        self.dstAmount = dstAmount
+        self.dstChain = dstChain
+        self.dstToken = dstToken
+        self.sender = sender
+        self.recipient = recipient
+        self.slippageBps = slippageBps
+        self.referrer = referrer
+        self.copyOf = copyOf
+        self.purpose = purpose
+        self.splitId = splitId
+        self.splitShare = splitShare
+        self.note = note
+    }
+}
+
+/// One `quote` event of `streamQuotes`: a full quote response plus its sequence number (1, 2, ...).
+public struct QuoteStreamUpdate: Decodable, Sendable, Equatable {
+    public let seq: Int
+    /// The quote set, exactly as `GET /v1/quote` returns it.
+    public let response: QuoteResponse
+
+    /// `response.best`.
+    public var best: Quote { response.best }
+    /// `response.quotes`.
+    public var quotes: [Quote] { response.quotes }
+
+    enum CodingKeys: String, CodingKey { case seq }
+
+    public init(seq: Int, response: QuoteResponse) {
+        self.seq = seq
+        self.response = response
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try c.decode(Int.self, forKey: .seq)
+        response = try QuoteResponse(from: decoder)
+    }
+}
+
+// MARK: - Address screening
+
+/// One listed address of a quote, order or checkout quote.
+public struct ScreeningMatch: Codable, Sendable, Equatable {
+    public let address: String
+    /// "sender", "recipient", "refundTo", "payer" or "payout".
+    public let role: String
+    /// e.g. ["OFAC SDN"].
+    public let lists: [String]
+}
+
+/// Address screening on quotes, orders and checkout quotes (D-069). With enforcement on, a listed
+/// address is refused with `ADDRESS_SANCTIONED` instead.
+public struct ScreeningAnnotation: Codable, Sendable, Equatable {
+    /// "ofac_sdn".
+    public let source: String
+    /// The publish date of the list version checked.
+    public let listUpdatedAt: String?
+    /// Listed addresses of the request (empty when none).
+    public let sanctioned: [ScreeningMatch]
+}
+
+/// One address's result of `screen`.
+public struct ScreeningResult: Codable, Sendable, Equatable {
+    /// As sent.
+    public let address: String
+    public let sanctioned: Bool
+    /// Lists the address is on ("OFAC SDN"); empty when not listed.
+    public let lists: [String]
+    public let source: String
+    /// The publish date of the list checked; nil while the API has no list loaded.
+    public let listUpdatedAt: String?
+}
+
+/// The sanctions list version the API has loaded.
+public struct ScreeningList: Codable, Sendable, Equatable {
+    public let source: String
+    public let name: String
+    public let publishedAt: String?
+    public let fetchedAt: String
+    public let addressCount: Int
+}
+
+/// The body of `POST /v1/screen`.
+public struct ScreenResponse: Codable, Sendable, Equatable {
+    /// One result per address, in order.
+    public let results: [ScreeningResult]
+    /// Nil until the API has downloaded a list (then nothing is reported as sanctioned).
+    public let list: ScreeningList?
+    /// The API refuses listed addresses for everyone (`ADDRESS_SANCTIONED`).
+    public let enforced: Bool
 }
 
 // MARK: - Transactions
@@ -784,12 +914,15 @@ public struct CreateCheckoutParams: Encodable, Sendable, Equatable {
     public var cancelUrl: String?
     /// 5-10080; the API default (60) applies when nil.
     public var expiresInMinutes: Int?
+    /// Embedded checkout: the only sites (exact origins, e.g. "https://shop.example") that may show
+    /// the session in an iframe. Nil or empty = any.
+    public var embedOrigins: [String]?
 
     public init(
         amount: String, settleChain: String, settleToken: String, recipient: String,
         merchantName: String? = nil, description: String? = nil, reference: String? = nil,
         metadata: [String: String]? = nil, successUrl: String? = nil, cancelUrl: String? = nil,
-        expiresInMinutes: Int? = nil
+        expiresInMinutes: Int? = nil, embedOrigins: [String]? = nil
     ) {
         self.amount = amount
         self.settleChain = settleChain
@@ -802,6 +935,7 @@ public struct CreateCheckoutParams: Encodable, Sendable, Equatable {
         self.successUrl = successUrl
         self.cancelUrl = cancelUrl
         self.expiresInMinutes = expiresInMinutes
+        self.embedOrigins = embedOrigins
     }
 }
 
@@ -815,7 +949,10 @@ public struct CheckoutSettlement: Codable, Sendable, Equatable {
 
 /// The current (or final) payment attempt of a session.
 public struct CheckoutPayment: Codable, Sendable, Equatable {
-    public let quoteId: String
+    /// "wallet" (paid through a quote on the page) or "transfer" (a scan-to-pay transfer, no quote).
+    public let method: String?
+    /// Nil for a scan-to-pay transfer.
+    public let quoteId: String?
     public let payer: String?
     public let srcChainId: Int64?
     public let srcToken: String?
@@ -856,8 +993,95 @@ public struct CheckoutSession: Codable, Sendable, Equatable {
     public let reference: String?
     /// Returned only with the owning account's API key.
     public let metadata: [String: String]?
+    /// Only when paid plans are enabled: false when the merchant's plan is white-label.
+    public let branding: Bool?
+    /// The payer can be shown a "Send to address" QR (`startCheckoutTransfer`).
+    public let transferAvailable: Bool?
+    /// Scan-to-pay state once the payer asked for a QR, else nil.
+    public let transfer: CheckoutTransfer?
+    /// Sites allowed to embed this checkout (empty = any).
+    public let embedOrigins: [String]?
+    /// "Pay with Bitcoin" (only where the API enabled it): this session can show a BTC deposit address.
+    public let bitcoinAvailable: Bool?
+    /// The Bitcoin payment once the payer asked for it (`startCheckoutBitcoin`), else nil.
+    public let bitcoin: CheckoutBitcoin?
     public let createdAt: String
     public let updatedAt: String
+}
+
+/// LayerHop's fee on top of a scan-to-pay transfer.
+public struct CheckoutTransferFee: Codable, Sendable, Equatable {
+    public let bps: Int
+    public let amount: String
+}
+
+/// A transaction seen paying a scan-to-pay session.
+public struct CheckoutTransferTx: Codable, Sendable, Equatable {
+    public let hash: String
+    public let amount: String
+    public let at: String?
+}
+
+/// Scan-to-pay ("Send to address"). `evm_transfer`: send exactly `amount` of `token` to `address` on
+/// `chainId`. `solana_pay`: scan `uri` (a Solana Pay transaction request). `evm_splitter`: send
+/// exactly `amount` to `address`, the session's own fee-splitting deposit address.
+public struct CheckoutTransfer: Codable, Sendable, Equatable {
+    /// "evm_transfer", "solana_pay" or "evm_splitter".
+    public let kind: String
+    public let chainId: Int64
+    public let token: String
+    public let symbol: String
+    public let decimals: Int
+    public let address: String
+    /// What to send now, base units.
+    public let amount: String
+    public let amountDue: String
+    public let fee: CheckoutTransferFee?
+    /// QR payload: EIP-681 (EVM) or a Solana Pay transaction request.
+    public let uri: String
+    /// Solana Pay transfer request (plain transfer), only when enabled.
+    public let transferUri: String?
+    public let reference: String?
+    /// Confirmed so far.
+    public let received: String
+    /// Seen but still confirming.
+    public let seen: String
+    /// "waiting", "partial", "paid" or "overpaid".
+    public let state: String
+    public let txs: [CheckoutTransferTx]
+    public let startedAt: String
+    /// `evm_splitter` only: the sweep that paid the deposit out to the merchant.
+    public let sweepTxHash: String?
+}
+
+/// One Bitcoin quote shown for a session (every address shown stays watched).
+public struct CheckoutBitcoinQuote: Codable, Sendable, Equatable {
+    public let address: String
+    public let amountSats: String
+    public let status: String
+    public let requestId: String
+    public let createdAt: String
+}
+
+/// "Pay with Bitcoin": send exactly `amountSats` (`amountBtc`) to `address`; the merchant receives
+/// `amountOut` of the settlement token. `uri` is the BIP21 payment request for the QR. After
+/// `expiresAt` call `startCheckoutBitcoin` again for a fresh quote.
+public struct CheckoutBitcoin: Codable, Sendable, Equatable {
+    public let address: String
+    public let amountSats: String
+    public let amountBtc: String
+    public let uri: String
+    public let amountOut: String
+    public let expiresAt: String
+    public let expired: Bool
+    /// Relay status: waiting, depositing, pending, submitted, success, failure or refund.
+    public let status: String
+    /// Satoshis seen at `address` (mempool included).
+    public let seenSats: String
+    public let requestId: String
+    public let feeBps: Int
+    public let refundAddress: String?
+    public let quotes: [CheckoutBitcoinQuote]
 }
 
 /// Filters for `GET /v1/checkout/sessions`. Nil fields are omitted.
@@ -922,6 +1146,8 @@ public struct CheckoutQuoteResponse: Codable, Sendable, Equatable {
     public let best: CheckoutQuote
     public let quotes: [CheckoutQuote]
     public let errors: [ProviderFailure]?
+    /// Address screening of the payer (D-069), once the API has a list loaded.
+    public let screening: ScreeningAnnotation?
 }
 
 // MARK: - Products
@@ -1830,6 +2056,8 @@ public struct WebhookEventData: Codable, Sendable, Equatable {
     public let subscription: Subscription?
     public let limitOrder: LimitOrder?
     public let fill: Order?
+    /// The settled payment on x402.payment.settled.
+    public let payment: X402Payment?
 }
 
 /// The body of `POST /v1/webhooks/trigger`.
@@ -1838,6 +2066,334 @@ public struct TriggerWebhookResponse: Codable, Sendable, Equatable {
     /// The number of test endpoints the event was queued for.
     public let deliveries: Int
     public let payload: WebhookEvent
+}
+
+/// One delivery queued by `resendWebhookEvent`.
+public struct WebhookResendDelivery: Codable, Sendable, Equatable {
+    public let id: String
+    public let endpointId: String
+}
+
+/// The body of `POST /v1/webhooks/events/{id}/resend`. `deliveries` is empty when only open streams
+/// get the event.
+public struct WebhookResendResult: Codable, Sendable, Equatable {
+    public let eventId: String
+    public let type: WebhookEventType?
+    public let livemode: Bool?
+    public let deliveries: [WebhookResendDelivery]
+}
+
+// MARK: - Usage
+
+/// The bucket size of `usage`.
+public struct UsageBucket: LayerHopStringValue {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let hour: UsageBucket = "hour"
+    public static let day: UsageBucket = "day"
+}
+
+/// Filters for `GET /v1/usage`. Times are ISO 8601 or unix seconds. Nil fields are omitted.
+public struct UsageParams: Sendable, Equatable {
+    /// API default `day` (the last 30 days); `hour` covers the last 48 hours by default.
+    public var bucket: UsageBucket?
+    /// Inclusive start.
+    public var from: String?
+    /// Exclusive end (default now).
+    public var to: String?
+    /// Only requests made with this key of your account.
+    public var keyId: String?
+
+    public init(bucket: UsageBucket? = nil, from: String? = nil, to: String? = nil, keyId: String? = nil) {
+        self.bucket = bucket
+        self.from = from
+        self.to = to
+        self.keyId = keyId
+    }
+}
+
+/// Requests per HTTP status class.
+public struct StatusClassCounts: Codable, Sendable, Equatable {
+    public let status2xx: Int
+    public let status3xx: Int
+    public let status4xx: Int
+    public let status5xx: Int
+
+    enum CodingKeys: String, CodingKey {
+        case status2xx = "2xx"
+        case status3xx = "3xx"
+        case status4xx = "4xx"
+        case status5xx = "5xx"
+    }
+}
+
+/// Totals of a usage report. Latency percentiles are estimates (nil without traffic).
+public struct UsageTotals: Codable, Sendable, Equatable {
+    public let requests: Int
+    public let errors: Int
+    public let byStatusClass: StatusClassCounts
+    public let avgMs: Double?
+    public let p50Ms: Double?
+    public let p95Ms: Double?
+}
+
+/// One bucket of a usage report.
+public struct UsagePoint: Codable, Sendable, Equatable {
+    public let ts: String
+    public let requests: Int
+    public let errors: Int
+    public let byStatusClass: StatusClassCounts
+    public let p50Ms: Double?
+    public let p95Ms: Double?
+}
+
+/// Usage of one endpoint group (`quote`, `orders`, `checkout`, ...; unknown paths count as `other`).
+public struct UsageEndpoint: Codable, Sendable, Equatable {
+    public let group: String
+    public let requests: Int
+    public let errors: Int
+    public let byStatusClass: StatusClassCounts
+    public let avgMs: Double?
+    public let p50Ms: Double?
+    public let p95Ms: Double?
+}
+
+/// How often a stable error code was returned, per endpoint group.
+public struct UsageErrorCode: Codable, Sendable, Equatable {
+    public let code: String
+    public let count: Int
+    public let byEndpoint: [String: Int]
+}
+
+/// The body of `GET /v1/usage`, for the key's own account and mode.
+public struct UsageReport: Codable, Sendable, Equatable {
+    public let bucket: UsageBucket
+    public let from: String
+    public let to: String
+    public let livemode: Bool
+    public let keyId: String?
+    public let totals: UsageTotals
+    public let series: [UsagePoint]
+    public let byEndpoint: [UsageEndpoint]
+    public let errorCodes: [UsageErrorCode]
+}
+
+/// Filters for `GET /v1/usage/errors`. Nil fields are omitted.
+public struct UsageErrorsParams: Sendable, Equatable {
+    /// Only this error code (e.g. "NO_ROUTE").
+    public var code: String?
+    public var keyId: String?
+    /// 1-200 (API default 50).
+    public var limit: Int?
+
+    public init(code: String? = nil, keyId: String? = nil, limit: Int? = nil) {
+        self.code = code
+        self.keyId = keyId
+        self.limit = limit
+    }
+}
+
+/// One failed request with a stable error code.
+public struct UsageError: Codable, Sendable, Equatable {
+    public let ts: String
+    public let keyId: String?
+    /// Quote it to support.
+    public let requestId: String
+    public let method: String
+    public let path: String
+    public let endpointGroup: String
+    public let status: Int
+    public let code: String
+    public let latencyMs: Int
+}
+
+// MARK: - x402
+
+/// One scheme and network the x402 facilitator supports.
+public struct X402SupportedKind: Codable, Sendable, Equatable {
+    /// 1 or 2.
+    public let x402Version: Int
+    /// "exact".
+    public let scheme: String
+    /// A CAIP-2 id (v2, "eip155:8453") or a network name (v1, "base").
+    public let network: String
+}
+
+/// The body of `GET /v1/x402/supported`.
+public struct X402Supported: Codable, Sendable, Equatable {
+    public let kinds: [X402SupportedKind]
+    public let extensions: [String]
+    public let signers: [String: [String]]
+    /// Whether `x402Settle` is enabled on this API.
+    public let settle: Bool
+}
+
+/// The body of `POST /v1/x402/requirements`. Nil optional fields are omitted.
+public struct X402RequirementsParams: Encodable, Sendable, Equatable {
+    /// The price you net per request, USDC base units ("10000" = 0.01 USDC).
+    public var amount: String
+    /// Your payout address on that network.
+    public var payTo: String
+    /// The resource URL or any stable id.
+    public var resource: String
+    /// "base" (API default), "optimism", "arbitrum", "polygon" or a CAIP-2 id.
+    public var network: String?
+    public var description: String?
+    public var mimeType: String?
+    /// 10-3600 (API default 60).
+    public var maxTimeoutSeconds: Int?
+
+    public init(
+        amount: String, payTo: String, resource: String, network: String? = nil,
+        description: String? = nil, mimeType: String? = nil, maxTimeoutSeconds: Int? = nil
+    ) {
+        self.amount = amount
+        self.payTo = payTo
+        self.resource = resource
+        self.network = network
+        self.description = description
+        self.mimeType = mimeType
+        self.maxTimeoutSeconds = maxTimeoutSeconds
+    }
+}
+
+/// Your fee-splitting deposit address for one resource and payout address (the requirements' `payTo`).
+public struct X402Payee: Codable, Sendable, Equatable {
+    public let id: String
+    public let network: String
+    public let chainId: Int64
+    public let asset: String
+    public let depositAddress: String
+    /// Your payout address.
+    public let merchant: String
+    public let resource: String
+    public let feeBps: Int
+    public let factory: String
+    public let lastSweepTx: String?
+    public let lastSweptAt: String?
+}
+
+/// LayerHop's fee on top of the price.
+public struct X402Fee: Codable, Sendable, Equatable {
+    public let bps: Int
+    public let amount: String
+}
+
+/// x402 v2 `PaymentRequirements` (scheme "exact").
+public struct X402RequirementsV2: Codable, Sendable, Equatable {
+    public let scheme: String
+    /// CAIP-2 id, e.g. "eip155:8453".
+    public let network: String
+    /// USDC base units the payer signs (price + LayerHop fee).
+    public let amount: String
+    public let asset: String
+    /// Your fee-splitting deposit address.
+    public let payTo: String
+    public let maxTimeoutSeconds: Int
+    /// The asset's EIP-712 domain (`name`, `version`).
+    public let extra: JSONValue?
+}
+
+/// The body of `POST /v1/x402/requirements`. Answer `402 Payment Required` with `paymentRequired`
+/// (base64 of its JSON in the `PAYMENT-REQUIRED` header) or `acceptsV1`.
+public struct X402RequirementsResponse: Codable, Sendable, Equatable {
+    public let payee: X402Payee
+    /// Your net price.
+    public let price: String
+    /// What the payer signs (price + fee).
+    public let amount: String
+    public let fee: X402Fee
+    public let accepts: [X402RequirementsV2]
+    /// The same requirements in x402 v1 form.
+    public let acceptsV1: [JSONValue]
+    /// The whole x402 v2 `PaymentRequired` object.
+    public let paymentRequired: JSONValue
+}
+
+/// The body of `POST /v1/x402/verify` and `/settle`: the decoded payment header and the
+/// requirements you answered the 402 with (v1 or v2 form), passed through unchanged.
+public struct X402FacilitatorRequest: Encodable, Sendable, Equatable {
+    /// 1 or 2; omitted when nil.
+    public var x402Version: Int?
+    /// The decoded `X-PAYMENT` (v1) or `PAYMENT-SIGNATURE` (v2) header.
+    public var paymentPayload: JSONValue
+    public var paymentRequirements: JSONValue
+
+    public init(paymentPayload: JSONValue, paymentRequirements: JSONValue, x402Version: Int? = nil) {
+        self.paymentPayload = paymentPayload
+        self.paymentRequirements = paymentRequirements
+        self.x402Version = x402Version
+    }
+}
+
+/// The body of `POST /v1/x402/verify`. `isValid == false` carries an x402 `invalidReason`.
+public struct X402VerifyResponse: Codable, Sendable, Equatable {
+    public let isValid: Bool
+    /// e.g. "insufficient_funds", "invalid_exact_evm_payload_signature".
+    public let invalidReason: String?
+    public let payer: String?
+    public let message: String?
+}
+
+/// The body of `POST /v1/x402/settle`. `errorReason == "settlement_pending"`: sent, receipt not in
+/// yet (LayerHop finishes it and x402.payment.settled fires then).
+public struct X402SettleResponse: Codable, Sendable, Equatable {
+    public let success: Bool
+    public let errorReason: String?
+    public let payer: String?
+    /// The transaction hash (empty when nothing was sent).
+    public let transaction: String
+    public let network: String
+    public let message: String?
+}
+
+/// A payment settled through LayerHop's x402 facilitator ("x402.payment").
+public struct X402Payment: Codable, Sendable, Equatable {
+    public let id: String
+    public let object: String
+    /// "submitted", "settled" or "failed".
+    public let status: String
+    public let statusDetail: String?
+    public let network: String
+    public let chainId: Int64
+    public let asset: String
+    public let payer: String
+    /// The deposit address paid.
+    public let payTo: String
+    /// What the payer paid (USDC base units).
+    public let amount: String
+    /// What you net after the deposit contract's fee.
+    public let merchantAmount: String
+    public let feeBps: Int
+    public let resource: String?
+    public let transaction: String?
+    /// The sweep that paid it out to you.
+    public let sweepTx: String?
+    public let settledAt: String?
+    public let createdAt: String
+    public let updatedAt: String?
+}
+
+/// Filters for `GET /v1/x402/payments`. Nil fields are omitted.
+public struct ListX402PaymentsParams: Sendable, Equatable {
+    /// "submitted", "settled" or "failed".
+    public var status: String?
+    public var cursor: String?
+    /// 1-200 (API default 50).
+    public var limit: Int?
+
+    public init(status: String? = nil, cursor: String? = nil, limit: Int? = nil) {
+        self.status = status
+        self.cursor = cursor
+        self.limit = limit
+    }
+}
+
+/// The body of `GET /v1/x402/payments`.
+public struct ListX402PaymentsResponse: Codable, Sendable, Equatable {
+    public let payments: [X402Payment]
+    public let nextCursor: String?
 }
 
 // MARK: - Gasless
