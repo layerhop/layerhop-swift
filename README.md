@@ -17,7 +17,7 @@ Xcode: **File → Add Package Dependencies…** and enter `https://github.com/la
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/layerhop/layerhop-swift", from: "0.8.0"),
+    .package(url: "https://github.com/layerhop/layerhop-swift", from: "0.9.0"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [.product(name: "LayerHop", package: "layerhop-swift")]),
@@ -80,7 +80,7 @@ let lh = LayerHopClient(options: .init(
     channel: "api",                      // default
     integrator: "myapp",                 // your partner id, sent on every quote
     integratorFeeBps: 25,                // honored only with a partner key
-    userAgent: "layerhop-swift/0.8.0"    // default
+    userAgent: "layerhop-swift/0.9.0"    // default
 ), session: myURLSession)                // optional custom URLSession
 ```
 
@@ -88,11 +88,12 @@ let lh = LayerHopClient(options: .init(
 
 | Area | Methods |
 |---|---|
+| Safety | `screen(addresses:)` |
 | Registry | `health()`, `chains()`, `tokens(chain:)`, `searchTokens(_:)`, `lookupToken(address:chain:)`, `getTokenRisk(chain:address:)`, `prices(ids:)`, `balances(address:chains:tokens:fresh:)`, `serviceStatus()` |
-| Swaps | `quote(_:)`, `quoteCalls(_:)`, `buildTx(quoteId:)`, `simulate(quoteId:)`, `submit(quoteId:signedTransaction:)`, `reportSubmitted(quoteId:txHash:)` |
+| Swaps | `quote(_:)`, `quoteExactOutput(_:)`, `streamQuotes(_:intervalMs:)`, `quoteCalls(_:)`, `buildTx(quoteId:)`, `simulate(quoteId:)`, `submit(quoteId:signedTransaction:)`, `reportSubmitted(quoteId:txHash:)` |
 | Gasless | `buildGasless(quoteId:)`, `submitGasless(quoteId:tradeSignature:approvalSignature:)`, `gaslessStatus(quoteId:)` |
 | Orders | `status(provider:id:)`, `watch(provider:id:interval:timeout:)`, `listOrders(_:)`, `streamOrder(quoteId:)` |
-| Checkout | `createCheckoutSession`, `getCheckoutSession(id:)`, `listCheckoutSessions`, `expireCheckoutSession(id:)`, `quoteCheckoutSession(id:_:)`, `streamCheckoutSession(id:)` |
+| Checkout | `createCheckoutSession`, `getCheckoutSession(id:)`, `listCheckoutSessions`, `expireCheckoutSession(id:)`, `quoteCheckoutSession(id:_:)`, `startCheckoutTransfer(id:)`, `startCheckoutBitcoin(id:refundAddress:)`, `streamCheckoutSession(id:)` |
 | Products | `createCheckoutProduct`, `getCheckoutProduct(id:)`, `listCheckoutProducts`, `updateCheckoutProduct(id:_:)`, `startProductCheckout(id:_:)` |
 | Refunds | `createRefund(sessionId:_:)`, `listRefunds(sessionId:)` |
 | Invoices | `createInvoice`, `getInvoice(id:)`, `listInvoices`, `updateInvoice(id:_:)`, `sendInvoice(id:)`, `voidInvoice(id:)`, `getPublicInvoice(id:)`, `payInvoice(id:)` |
@@ -101,16 +102,68 @@ let lh = LayerHopClient(options: .init(
 | Limit orders (Solana) | `createLimitOrder`, `submitLimitOrder(id:signedTransaction:)`, `getLimitOrder(id:)`, `listLimitOrders`, `cancelLimitOrder(id:)`, `simulateLimitOrder(id:outcome:)` |
 | Recurring orders (Solana) | `createRecurringOrder`, `submitRecurringOrder(requestId:signedTransaction:)`, `listRecurringOrders`, `cancelRecurringOrder(id:wallet:)` |
 | Splits, tips, payouts | `createSplit`, `getSplit(id:)`, `updateSplit(id:editToken:_:)`, `getTipJar(address:)`, `planPayouts`, `buildPayoutTransfers` |
-| Webhooks | `streamWebhookEvents()`, `triggerWebhookEvent(type:)`, `Webhook.verifySignature`, `Webhook.constructEvent`, `Webhook.sign` |
+| Webhooks | `streamWebhookEvents(since:)`, `triggerWebhookEvent(type:)`, `resendWebhookEvent(id:endpointId:)`, `Webhook.verifySignature`, `Webhook.constructEvent`, `Webhook.sign` |
+| Usage | `usage(_:)`, `usageErrors(_:)` |
+| x402 | `x402Supported()`, `x402Requirements(_:)`, `x402Verify(_:)`, `x402Settle(_:)`, `listX402Payments(_:)`, `getX402Payment(id:)` |
+
+### Exact output and live quotes
+
+```swift
+let r = try await lh.quoteExactOutput(ExactOutputQuoteParams(
+    srcChain: "base", srcToken: "USDC", dstAmount: "100000000", dstChain: "arbitrum", dstToken: "USDC",
+    sender: "0xYou", recipient: "0xYou"))
+print(r.best.srcAmount ?? "", r.best.srcAmountMax ?? "")   // check the balance against srcAmountMax
+
+// GET /v1/quote/stream: a new quote set whenever the best route or an amount changes (5 min max)
+for try await update in lh.streamQuotes(params, intervalMs: 10_000) {
+    print(update.seq, update.best.quoteId, update.best.dstAmount)
+}
+```
+
+Each refresh counts as one request against your rate limit, and a key can hold 3 open quote streams. A failed refresh ends the loop with `.api(code:...)` (`NO_ROUTE`, `RATE_LIMITED`, `ADDRESS_SANCTIONED`, ...). Breaking out of the loop closes the connection.
+
+### Address screening
+
+```swift
+let s = try await lh.screen(addresses: ["0x098B716B8Aaf21512996dC57EB0615e2383E2f96"])
+print(s.results[0].sanctioned, s.results[0].lists)   // true, ["OFAC SDN"]
+```
+
+Quotes and checkout quotes carry `screening` (listed addresses of the request) once the API has a list loaded. Where screening is enforced, a listed address gets `ADDRESS_SANCTIONED` (HTTP 451).
 
 ### Checkout
 
 ```swift
 let s = try await lh.createCheckoutSession(CreateCheckoutParams(
     amount: "49000000", settleChain: "base", settleToken: "USDC",
-    recipient: "0xYourPayoutAddress", reference: "order_1042"))
+    recipient: "0xYourPayoutAddress", reference: "order_1042",
+    embedOrigins: ["https://shop.example"]))   // optional: only these sites may embed it
 // send the customer to s.url; fulfil on the checkout.session.completed webhook
 ```
+
+On the payer's side, `startCheckoutTransfer(id:)` returns the session with `transfer` (a "Send to address" QR, when `transferAvailable`), and `startCheckoutBitcoin(id:refundAddress:)` the session with `bitcoin` (a BTC deposit address, the exact `amountSats` and a BIP21 `uri`, when `bitcoinAvailable`). `payment.method` is `wallet` or `transfer`; a transfer payment has no `quoteId`.
+
+### Usage and webhook resends
+
+```swift
+let report = try await lh.usage(UsageParams(bucket: .hour))   // totals, series, byEndpoint, errorCodes
+let errors = try await lh.usageErrors(UsageErrorsParams(code: "NO_ROUTE", limit: 20))
+_ = try await lh.resendWebhookEvent(id: "evt_...")            // or endpointId: "whe_..."
+for try await e in lh.streamWebhookEvents(since: lastSeenISO) { print(e.type) }   // replays missed events first
+```
+
+### x402 pay-per-request
+
+```swift
+let req = try await lh.x402Requirements(X402RequirementsParams(
+    amount: "10000", payTo: "0xYourPayoutAddress", resource: "https://api.example.com/v1/weather"))
+// answer 402 with req.paymentRequired (base64 JSON in PAYMENT-REQUIRED); when the client retries:
+let pay = X402FacilitatorRequest(paymentPayload: decodedHeader, paymentRequirements: acceptedRequirements)
+let check = try await lh.x402Verify(pay)              // read-only
+if check.isValid { let settled = try await lh.x402Settle(pay) }
+```
+
+The decoded payment header and the requirements you answered with are `JSONValue`s, sent unchanged. `payTo` in the requirements is your own fee-splitting deposit address, swept to your payout address. Settlements arrive as `x402.payment.settled` webhooks (`event.data.payment`) and in `listX402Payments`.
 
 ### Invoices
 
@@ -237,7 +290,7 @@ Typed helpers read `details`:
 - `e.minAmount`, `e.minAmountUsd`, `e.minAmountApprox`: the route minimum on `AMOUNT_TOO_SMALL`.
 - `e.providerErrors`: per-provider failures.
 
-0.7.0 added the `details` value to `.api` and the `.tvm` case to `BuiltTx`: exhaustive `switch` statements need `, _` / the new case.
+0.9.0 made `CheckoutPayment.quoteId` optional (nil for scan-to-pay transfers). 0.7.0 added the `details` value to `.api` and the `.tvm` case to `BuiltTx`: exhaustive `switch` statements need `, _` / the new case.
 
 ## Verify webhooks
 

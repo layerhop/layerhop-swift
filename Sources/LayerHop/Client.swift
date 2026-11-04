@@ -305,27 +305,65 @@ extension LayerHopClient {
 
     /// Asks every provider for a price (`GET /v1/quote`). `best` is the highest output for the user.
     public func quote(_ p: QuoteParams) async throws -> QuoteResponse {
-        let slip = (p.slippageBps ?? 0) == 0 ? 50 : p.slippageBps!
-        var q: [(String, String)] = [
-            ("srcChain", p.srcChain), ("srcToken", p.srcToken), ("amount", p.amount),
-            ("dstChain", p.dstChain), ("dstToken", p.dstToken), ("sender", p.sender),
-            ("recipient", p.recipient), ("slippageBps", String(slip)), ("channel", options.channel),
-        ]
-        if let i = options.integrator { q.append(("integrator", i)) }
-        if let f = options.integratorFeeBps { q.append(("integratorFeeBps", String(f))) }
+        try await send("GET", "/quote", query: quoteQuery(p))
+    }
+
+    /// Receive an exact amount (`GET /v1/quote` with `dstAmount`): the recipient gets exactly
+    /// `dstAmount`; each quote reports `srcAmount` (what the sender pays) and `srcAmountMax` (the
+    /// most the transaction can take, for balance checks). Only providers that quote a fixed output
+    /// answer.
+    public func quoteExactOutput(_ p: ExactOutputQuoteParams) async throws -> QuoteResponse {
+        try await send("GET", "/quote", query: quoteQuery(p))
+    }
+
+    /// Checks up to 100 addresses against the OFAC SDN list (`POST /v1/screen`). Public. A list
+    /// lookup only: no clustering or risk scoring, and not legal advice.
+    public func screen(addresses: [String]) async throws -> ScreenResponse {
+        try await send("POST", "/screen", body: ["addresses": addresses])
+    }
+
+    /// `GET /v1/quote` / `GET /v1/quote/stream` query parameters.
+    func quoteQuery(_ p: QuoteParams) -> [(String, String)] {
+        var q = quoteBaseQuery(
+            srcChain: p.srcChain, srcToken: p.srcToken, amount: ("amount", p.amount),
+            dstChain: p.dstChain, dstToken: p.dstToken, sender: p.sender, recipient: p.recipient,
+            slippageBps: p.slippageBps)
         if let usd = p.gasOnArrivalUsd, usd > 0 {
             q.append(("gasOnArrivalUsd", formatNumber(usd)))
         } else if p.gasOnArrival {
             q.append(("gasOnArrival", "true"))
         }
         if p.gasless { q.append(("gasless", "true")) }
-        q.add("referrer", p.referrer)
-        q.add("copyOf", p.copyOf)
-        q.add("purpose", p.purpose?.rawValue)
-        q.add("splitId", p.splitId)
-        if let s = p.splitShare { q.append(("splitShare", String(s))) }
-        q.add("note", p.note)
-        return try await send("GET", "/quote", query: q)
+        q.addQuoteExtras(
+            referrer: p.referrer, copyOf: p.copyOf, purpose: p.purpose, splitId: p.splitId,
+            splitShare: p.splitShare, note: p.note)
+        return q
+    }
+
+    func quoteQuery(_ p: ExactOutputQuoteParams) -> [(String, String)] {
+        var q = quoteBaseQuery(
+            srcChain: p.srcChain, srcToken: p.srcToken, amount: ("dstAmount", p.dstAmount),
+            dstChain: p.dstChain, dstToken: p.dstToken, sender: p.sender, recipient: p.recipient,
+            slippageBps: p.slippageBps)
+        q.addQuoteExtras(
+            referrer: p.referrer, copyOf: p.copyOf, purpose: p.purpose, splitId: p.splitId,
+            splitShare: p.splitShare, note: p.note)
+        return q
+    }
+
+    private func quoteBaseQuery(
+        srcChain: String, srcToken: String, amount: (String, String), dstChain: String, dstToken: String,
+        sender: String, recipient: String, slippageBps: Int?
+    ) -> [(String, String)] {
+        let slip = (slippageBps ?? 0) == 0 ? 50 : slippageBps!
+        var q: [(String, String)] = [
+            ("srcChain", srcChain), ("srcToken", srcToken), amount,
+            ("dstChain", dstChain), ("dstToken", dstToken), ("sender", sender),
+            ("recipient", recipient), ("slippageBps", String(slip)), ("channel", options.channel),
+        ]
+        if let i = options.integrator { q.append(("integrator", i)) }
+        if let f = options.integratorFeeBps { q.append(("integratorFeeBps", String(f))) }
+        return q
     }
 
     /// Destination calls (`POST /v1/quote`): an exact-output quote whose output (`dstAmount`) is used
@@ -519,6 +557,22 @@ extension LayerHopClient {
     /// `reportSubmitted` as usual.
     public func quoteCheckoutSession(id: String, _ p: CheckoutQuoteParams) async throws -> CheckoutQuoteResponse {
         try await send("POST", "/checkout/sessions/\(escapeComponent(id))/quote", body: p)
+    }
+
+    /// Shows a "Send to address" QR for a session (`POST /v1/checkout/sessions/{id}/transfer`).
+    /// Public and idempotent; check `transferAvailable` first. Returns the session with `transfer`.
+    public func startCheckoutTransfer(id: String) async throws -> CheckoutSession {
+        try await send("POST", "/checkout/sessions/\(escapeComponent(id))/transfer", body: Empty())
+    }
+
+    /// "Pay with Bitcoin" (`POST /v1/checkout/sessions/{id}/bitcoin`): shows a Bitcoin deposit
+    /// address for the session, or a fresh quote once the last one expired. Public; only where the
+    /// API enabled it (check `bitcoinAvailable`). `refundAddress` is an optional Bitcoin address for
+    /// refunds. Returns the session with `bitcoin`.
+    public func startCheckoutBitcoin(id: String, refundAddress: String? = nil) async throws -> CheckoutSession {
+        struct Body: Encodable { let refundAddress: String? }
+        let r = (refundAddress ?? "").isEmpty ? nil : refundAddress
+        return try await send("POST", "/checkout/sessions/\(escapeComponent(id))/bitcoin", body: Body(refundAddress: r))
     }
 
     // MARK: Products
@@ -864,6 +918,81 @@ extension LayerHopClient {
     public func triggerWebhookEvent(type: WebhookEventType) async throws -> TriggerWebhookResponse {
         try await send("POST", "/webhooks/trigger", body: ["type": type.rawValue])
     }
+
+    /// Sends an event of the key's mode again, with the same id and payload
+    /// (`POST /v1/webhooks/events/{id}/resend`): to `endpointId`, or to every subscribed endpoint,
+    /// and to open event streams. Events are kept 30 days.
+    public func resendWebhookEvent(id: String, endpointId: String? = nil) async throws -> WebhookResendResult {
+        struct Body: Encodable { let endpointId: String? }
+        let e = (endpointId ?? "").isEmpty ? nil : endpointId
+        return try await send("POST", "/webhooks/events/\(escapeComponent(id))/resend", body: Body(endpointId: e))
+    }
+
+    // MARK: Usage
+
+    /// Requests of the key's account and mode per hour or day (`GET /v1/usage`): status classes,
+    /// p50 / p95 latency, endpoint groups and error codes.
+    public func usage(_ p: UsageParams = UsageParams()) async throws -> UsageReport {
+        var q: [(String, String)] = []
+        q.add("bucket", p.bucket?.rawValue)
+        q.add("from", p.from)
+        q.add("to", p.to)
+        q.add("keyId", p.keyId)
+        return try await send("GET", "/usage", query: q)
+    }
+
+    /// The newest failed requests with a stable error code (`GET /v1/usage/errors`), newest first.
+    public func usageErrors(_ p: UsageErrorsParams = UsageErrorsParams()) async throws -> [UsageError] {
+        struct Body: Decodable { let errors: [UsageError] }
+        var q: [(String, String)] = []
+        q.add("code", p.code)
+        q.add("keyId", p.keyId)
+        q.add("limit", p.limit)
+        let r: Body = try await send("GET", "/usage/errors", query: q)
+        return r.errors
+    }
+
+    // MARK: x402
+
+    /// The schemes and networks the x402 facilitator supports (`GET /v1/x402/supported`). Public.
+    public func x402Supported() async throws -> X402Supported {
+        try await send("GET", "/x402/supported")
+    }
+
+    /// The x402 payment requirements to answer `402 Payment Required` with, for a price you net per
+    /// request (`POST /v1/x402/requirements`). `payTo` in the requirements is your own fee-splitting
+    /// deposit address, not your payout address.
+    public func x402Requirements(_ p: X402RequirementsParams) async throws -> X402RequirementsResponse {
+        try await send("POST", "/x402/requirements", body: p)
+    }
+
+    /// Verifies an x402 payment to your own requirements (`POST /v1/x402/verify`, read-only).
+    /// `isValid == false` carries an `invalidReason`; nothing moves.
+    public func x402Verify(_ p: X402FacilitatorRequest) async throws -> X402VerifyResponse {
+        try await send("POST", "/x402/verify", body: p)
+    }
+
+    /// Settles an x402 payment (`POST /v1/x402/settle`, live key). Repeating the call returns the
+    /// same result. FORBIDDEN while settlement is not enabled on the API, and for test keys.
+    public func x402Settle(_ p: X402FacilitatorRequest) async throws -> X402SettleResponse {
+        try await send("POST", "/x402/settle", body: p)
+    }
+
+    /// Payments settled through LayerHop for your account, newest first (`GET /v1/x402/payments`).
+    public func listX402Payments(_ p: ListX402PaymentsParams = ListX402PaymentsParams()) async throws
+        -> ListX402PaymentsResponse
+    {
+        var q: [(String, String)] = []
+        q.add("status", p.status)
+        q.add("cursor", p.cursor)
+        q.add("limit", p.limit)
+        return try await send("GET", "/x402/payments", query: q)
+    }
+
+    /// One x402 payment (`GET /v1/x402/payments/{id}`).
+    public func getX402Payment(id: String) async throws -> X402Payment {
+        try await send("GET", "/x402/payments/\(escapeComponent(id))")
+    }
 }
 
 extension Array where Element == (String, String) {
@@ -873,5 +1002,17 @@ extension Array where Element == (String, String) {
 
     mutating func add(_ key: String, _ value: Int?) {
         if let value, value > 0 { append((key, String(value))) }
+    }
+
+    mutating func addQuoteExtras(
+        referrer: String?, copyOf: String?, purpose: QuotePurpose?, splitId: String?, splitShare: Int?,
+        note: String?
+    ) {
+        add("referrer", referrer)
+        add("copyOf", copyOf)
+        add("purpose", purpose?.rawValue)
+        add("splitId", splitId)
+        if let s = splitShare { append(("splitShare", String(s))) }
+        add("note", note)
     }
 }

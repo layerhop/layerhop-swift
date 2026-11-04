@@ -23,26 +23,64 @@ extension LayerHopClient {
     }
 
     /// Streams your account's webhook events of the API key's mode as they are created, with the
-    /// exact payloads your endpoints receive (`GET /v1/webhooks/stream`). Needs an API key. The
-    /// server closes the stream after at most 30 minutes; reconnect to continue.
-    public func streamWebhookEvents() -> AsyncThrowingStream<WebhookEvent, Error> {
-        streamSSE("/webhooks/stream", event: "event") { (ev: inout WebhookEvent, data: Data) in
+    /// exact payloads your endpoints receive, plus events resent later (`GET /v1/webhooks/stream`).
+    /// Needs an API key. `since` (ISO 8601, at most an hour back) first replays the events you
+    /// missed, e.g. after a reconnect. The server closes the stream after at most 30 minutes;
+    /// reconnect to continue.
+    public func streamWebhookEvents(since: String? = nil) -> AsyncThrowingStream<WebhookEvent, Error> {
+        var q: [(String, String)] = []
+        q.add("since", since)
+        return streamSSE("/webhooks/stream", query: q, event: "event") { (ev: inout WebhookEvent, data: Data) in
             ev.raw = data
         }
     }
 
+    /// Live quotes (`GET /v1/quote/stream`, Server-Sent Events): yields a fresh ranked quote set at
+    /// once and then whenever the best route or any amount changes (and before the shown quote
+    /// expires). The API re-quotes every `intervalMs` (default 10000, at least 5000); each refresh
+    /// counts as one request against your rate limit. Ends after the stream's lifetime (5 minutes);
+    /// a failed refresh ends it with `.api` (e.g. NO_ROUTE, RATE_LIMITED, ADDRESS_SANCTIONED).
+    /// Stopping iteration closes the connection. Every `quoteId` is a normal quote for `buildTx`.
+    ///
+    /// ```swift
+    /// for try await update in client.streamQuotes(params) { print(update.seq, update.best.dstAmount) }
+    /// ```
+    public func streamQuotes(_ p: QuoteParams, intervalMs: Int? = nil) -> AsyncThrowingStream<QuoteStreamUpdate, Error> {
+        var q = quoteQuery(p)
+        q.add("intervalMs", intervalMs)
+        return streamSSE("/quote/stream", query: q, event: "quote", control: true)
+    }
+
+    /// Live exact-output quotes: as `streamQuotes(_:intervalMs:)` with `dstAmount`.
+    public func streamQuotes(_ p: ExactOutputQuoteParams, intervalMs: Int? = nil)
+        -> AsyncThrowingStream<QuoteStreamUpdate, Error>
+    {
+        var q = quoteQuery(p)
+        q.add("intervalMs", intervalMs)
+        return streamSSE("/quote/stream", query: q, event: "quote", control: true)
+    }
+
+    /// Reads a Server-Sent Events stream, yielding the decoded data of `event` frames. With
+    /// `control`, an `error` frame (`{status, error: {code, ...}}`) ends the stream with `.api` and
+    /// an `end` frame ends it normally.
     func streamSSE<T: Decodable & Sendable>(
-        _ path: String, event: String, adjust: (@Sendable (inout T, Data) -> Void)? = nil
+        _ path: String, query: [(String, String)] = [], event: String, control: Bool = false,
+        adjust: (@Sendable (inout T, Data) -> Void)? = nil
     ) -> AsyncThrowingStream<T, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var req = try self.makeRequest("GET", path, accept: "text/event-stream")
+                    var req = try self.makeRequest("GET", path, query: query, accept: "text/event-stream")
                     // Streams are long-lived: only an idle connection (no pings) should time out.
                     req.timeoutInterval = 300
                     var parser = SSEParser()
-                    let emit: (SSEParser.Frame) throws -> Void = { frame in
-                        guard frame.event == event else { return }
+                    // Returns false once the stream should stop (an `end` frame).
+                    let emit: (SSEParser.Frame) throws -> Bool = { frame in
+                        if control {
+                            if frame.event == "end" { return false }
+                            if frame.event == "error" { throw decodeStreamError(Data(frame.data.utf8)) }
+                        }
+                        guard frame.event == event else { return true }
                         let data = Data(frame.data.utf8)
                         do {
                             var v = try JSONDecoder().decode(T.self, from: data)
@@ -51,6 +89,7 @@ extension LayerHopClient {
                         } catch {
                             throw LayerHopError.decoding("decode \(event) event: \(error)")
                         }
+                        return true
                     }
                     #if canImport(FoundationNetworking)
                     // swift-corelibs-foundation has no URLSession.bytes: read the whole body.
@@ -60,7 +99,9 @@ extension LayerHopClient {
                             status: res.statusCode,
                             headerRequestId: res.value(forHTTPHeaderField: "x-request-id"), body: data)
                     }
-                    for frame in parser.feed(data) { try emit(frame) }
+                    for frame in parser.feed(data) {
+                        if try !emit(frame) { break }
+                    }
                     #else
                     let bytes: URLSession.AsyncBytes
                     let response: URLResponse
@@ -85,10 +126,12 @@ extension LayerHopClient {
                     do {
                         var chunk = [UInt8]()
                         chunk.reserveCapacity(4096)
-                        for try await b in bytes {
+                        reading: for try await b in bytes {
                             chunk.append(b)
                             if b == 0x0A {
-                                for frame in parser.feed(chunk) { try emit(frame) }
+                                for frame in parser.feed(chunk) {
+                                    if try !emit(frame) { break reading }
+                                }
                                 chunk.removeAll(keepingCapacity: true)
                             }
                         }
@@ -108,6 +151,13 @@ extension LayerHopClient {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+}
+
+/// The `data` of an `error` frame on a stream: `{"status": 404, "error": {"code": ..., ...}}`.
+func decodeStreamError(_ data: Data) -> LayerHopError {
+    struct Frame: Decodable { let status: Int? }
+    let status = (try? JSONDecoder().decode(Frame.self, from: data))?.status ?? 500
+    return decodeAPIError(status: status, headerRequestId: nil, body: data)
 }
 
 /// An incremental Server-Sent Events parser. Feed it bytes in any chunking; it returns the frames

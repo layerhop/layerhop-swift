@@ -8,7 +8,7 @@ import Foundation
 /// SDK-wide constants.
 public enum LayerHop {
     /// The SDK version, sent in the User-Agent header.
-    public static let version = "0.8.0"
+    public static let version = "0.9.0"
     /// The hosted API origin.
     public static let defaultBaseURL = "https://api.layerhop.com"
     /// LayerHop's internal chain id for Solana.
@@ -225,4 +225,6 @@ public struct WebhookEventType: LayerHopStringValue {
     public static let limitOrderCancelled: WebhookEventType = "limit_order.cancelled"
     public static let limitOrderExpired: WebhookEventType = "limit_order.expired"
     public static let limitOrderFailed: WebhookEventType = "limit_order.failed"
+    /// An x402 payment settled (`data.payment`).
+    public static let x402PaymentSettled: WebhookEventType = "x402.payment.settled"
 }
